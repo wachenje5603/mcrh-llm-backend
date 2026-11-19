@@ -10,6 +10,9 @@ const cors = require("cors");
 const crypto = require("crypto");
 
 const app = express();
+// Render (and most hosts) sit behind a proxy. Without this, every visitor looks like the same IP
+// and the 30-requests-per-minute limit is shared by ALL users.
+app.set("trust proxy", 1);
 const PORT = process.env.PORT || 3000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
@@ -29,26 +32,102 @@ const cacheKey = (prefix, data) =>
 // ---------- Rate limiter (per IP) ----------
 const rateBuckets = new Map();
 const RATE_WINDOW_MS = 60 * 1000;
-const RATE_MAX = 30;
+const RATE_MAX = 30;        // signed-in users: per minute, counted per user
+const RATE_MAX_ANON = 10;   // not signed in (login-page assistant): per minute, counted per IP
 
 function rateLimit(req, res, next) {
   const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
+  const id = req.user ? "u:" + req.user.uid : "ip:" + ip;
+  const max = req.user ? RATE_MAX : RATE_MAX_ANON;
   const now = Date.now();
-  const entry = rateBuckets.get(ip) || { count: 0, reset: now + RATE_WINDOW_MS };
+  const entry = rateBuckets.get(id) || { count: 0, reset: now + RATE_WINDOW_MS };
   if (now > entry.reset) { entry.count = 0; entry.reset = now + RATE_WINDOW_MS; }
   entry.count++;
-  rateBuckets.set(ip, entry);
+  rateBuckets.set(id, entry);
   if (rateBuckets.size > 1000) {
     for (const [k, v] of rateBuckets) if (Date.now() > v.reset + 60000) rateBuckets.delete(k);
   }
-  if (entry.count > RATE_MAX) {
+  if (entry.count > max) {
     return res.status(429).json({ error: "Rate limit reached. Wait a minute.", retryAfter: Math.ceil((entry.reset - now) / 1000) });
   }
   next();
 }
 
-app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type"] }));
+// ---- FIREBASE AUTH START ----
+// Pages send the signed-in user's Firebase ID token (Authorization: Bearer <token>).
+// It is verified here against Google's public signing keys, so no service account or extra
+// package is needed. Set REQUIRE_AUTH=false to switch enforcement off (e.g. while rolling out new pages).
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "moivoibiomed";
+const REQUIRE_AUTH = process.env.REQUIRE_AUTH !== "false";
+const GOOGLE_CERTS_URL = "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com";
+let certCache = { certs: null, expires: 0 };
+
+async function getGoogleCerts() {
+  if (certCache.certs && Date.now() < certCache.expires) return certCache.certs;
+  const r = await fetch(GOOGLE_CERTS_URL);
+  if (!r.ok) throw new Error("Could not fetch Google signing keys (" + r.status + ")");
+  const m = /max-age=(\d+)/.exec(r.headers.get("cache-control") || "");
+  certCache = { certs: await r.json(), expires: Date.now() + (m ? parseInt(m[1], 10) : 3600) * 1000 };
+  return certCache.certs;
+}
+
+const b64urlDecode = (s) => Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+
+async function verifyFirebaseToken(idToken, getCerts = getGoogleCerts, projectId = FIREBASE_PROJECT_ID) {
+  const parts = String(idToken).split(".");
+  if (parts.length !== 3) throw new Error("malformed token");
+  let header, payload;
+  try {
+    header = JSON.parse(b64urlDecode(parts[0]).toString("utf8"));
+    payload = JSON.parse(b64urlDecode(parts[1]).toString("utf8"));
+  } catch { throw new Error("malformed token"); }
+  if (header.alg !== "RS256" || !header.kid) throw new Error("bad algorithm");
+
+  let certs;
+  try {
+    certs = await getCerts();
+    if (!certs[header.kid]) { certCache.expires = 0; certs = await getCerts(); }   // keys rotate: refetch once
+  } catch (e) { throw Object.assign(new Error("auth service unavailable"), { status: 503 }); }
+  if (!certs[header.kid]) throw new Error("unknown signing key");
+
+  const verifier = crypto.createVerify("RSA-SHA256");
+  verifier.update(parts[0] + "." + parts[1]);
+  if (!verifier.verify(crypto.createPublicKey(certs[header.kid]), b64urlDecode(parts[2]))) throw new Error("bad signature");
+
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.aud !== projectId) throw new Error("wrong project");
+  if (payload.iss !== "https://securetoken.google.com/" + projectId) throw new Error("wrong issuer");
+  if (!payload.sub || typeof payload.sub !== "string") throw new Error("no subject");
+  if (typeof payload.exp !== "number" || payload.exp <= now) throw new Error("expired");
+  if (typeof payload.iat !== "number" || payload.iat > now + 300) throw new Error("issued in the future");
+  return { uid: payload.sub, email: payload.email || null };
+}
+
+// Reads the token if one is sent. A bad token is rejected; no token simply means "anonymous".
+async function authenticate(req, res, next) {
+  req.user = null;
+  const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || "");
+  if (!m) return next();
+  try { req.user = await verifyFirebaseToken(m[1].trim()); }
+  catch (err) {
+    console.warn("[auth] token rejected:", err.message);
+    if (err.status === 503) return res.status(503).json({ error: "Could not verify your login right now. Try again shortly." });
+    return res.status(401).json({ error: "Your session has expired or is invalid. Please sign in again." });
+  }
+  next();
+}
+function requireAuth(req, res, next) {
+  if (req.user || !REQUIRE_AUTH) return next();
+  res.status(401).json({ error: "Please sign in to use this feature." });
+}
+// ---- FIREBASE AUTH END ----
+
+// Optional: set ALLOWED_ORIGINS="https://your-site.web.app,https://your-site.firebaseapp.com" to accept
+// requests only from your own pages. Left unset, any site can call this API (previous behaviour).
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+app.use(cors({ origin: ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : "*", methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization"] }));
 app.use(express.json({ limit: "4mb" }));
+app.use(authenticate);
 app.use(rateLimit);
 
 // ---------- Groq core with retry + fallback ----------
@@ -109,6 +188,7 @@ app.get("/", (req, res) => res.json({
   service: "MCRH LLM Backend",
   version: "2.0.0",
   status: "ok",
+  authRequired: REQUIRE_AUTH,
   models: MODEL_CHAIN,
   endpoints: ["/health", "/api/chat", "/api/analyze", "/api/creative-summary", "/api/search", "/api/insights", "/api/explain"],
 }));
@@ -120,29 +200,36 @@ app.post("/api/chat", async (req, res) => {
   try {
     const { messages, context } = req.body || {};
     if (!Array.isArray(messages) || !messages.length) return res.status(400).json({ error: "messages required" });
-    const systemPrompt = buildChatSystemPrompt(context);
-    const result = await callGroq({ messages: messages.slice(-10), systemPrompt, temperature: 0.7, maxTokens: 700 });
+    const anon = !req.user;
+    // Only plain user/assistant turns are accepted; nobody can inject a "system" message.
+    const clean = messages.slice(anon ? -6 : -10).map(m => ({
+      role: m && m.role === "assistant" ? "assistant" : "user",
+      content: String((m && m.content) || "").slice(0, 4000),
+    }));
+    const systemPrompt = buildChatSystemPrompt(anon ? { currentPage: "Login Screen", userRole: "anonymous" } : context);
+    const result = await callGroq({ messages: clean, systemPrompt, temperature: 0.7, maxTokens: anon ? 400 : 700 });
     res.json(result);
   } catch (err) { handleError(res, err); }
 });
 
 // ---------- 2. Monthly report analysis (structured) ----------
-app.post("/api/analyze", async (req, res) => {
+app.post("/api/analyze", requireAuth, async (req, res) => {
   try {
     const { messages, systemPrompt, temperature, maxTokens } = req.body || {};
     if (!Array.isArray(messages) || !messages.length) return res.status(400).json({ error: "messages required" });
+    const t = Number(temperature);
     const result = await callGroq({
       messages: messages.slice(-10),
-      systemPrompt,
-      temperature: temperature ?? 0.4,
-      maxTokens: maxTokens ?? 1800,
+      systemPrompt: typeof systemPrompt === "string" ? systemPrompt.slice(0, 8000) : undefined,
+      temperature: Number.isFinite(t) ? Math.min(Math.max(t, 0), 1) : 0.4,
+      maxTokens: Math.min(Number(maxTokens) || 1800, 4000),
     });
     res.json(result);
   } catch (err) { handleError(res, err); }
 });
 
 // ---------- 3. Creative summary (narrative for PDF handout) ----------
-app.post("/api/creative-summary", async (req, res) => {
+app.post("/api/creative-summary", requireAuth, async (req, res) => {
   try {
     const { monthData, month, hospitalName } = req.body || {};
     if (!monthData) return res.status(400).json({ error: "monthData required" });
@@ -167,7 +254,7 @@ app.post("/api/creative-summary", async (req, res) => {
 });
 
 // ---------- 4. Natural-language search ----------
-app.post("/api/search", async (req, res) => {
+app.post("/api/search", requireAuth, async (req, res) => {
   try {
     const { query, items, itemType } = req.body || {};
     if (!query || !Array.isArray(items)) return res.status(400).json({ error: "query and items required" });
@@ -196,7 +283,7 @@ Given a natural language query and a list of ${itemType || "items"}, return ONLY
 });
 
 // ---------- 5. Analytics insights ----------
-app.post("/api/insights", async (req, res) => {
+app.post("/api/insights", requireAuth, async (req, res) => {
   try {
     const { data, focus } = req.body || {};
     if (!data) return res.status(400).json({ error: "data required" });
@@ -222,7 +309,7 @@ Return ONLY valid JSON.`;
 });
 
 // ---------- 6. Explain a record in plain language ----------
-app.post("/api/explain", async (req, res) => {
+app.post("/api/explain", requireAuth, async (req, res) => {
   try {
     const { record, type, audience } = req.body || {};
     if (!record) return res.status(400).json({ error: "record required" });
@@ -321,6 +408,7 @@ app.use((err, req, res, next) => { console.error(err); res.status(500).json({ er
 app.listen(PORT, () => {
   console.log(`\n🧠 MCRH LLM Backend v2.0 on port ${PORT}`);
   console.log(`   Models: ${MODEL_CHAIN.join(" → ")}`);
+  console.log(`   Auth: ${REQUIRE_AUTH ? "Firebase ID token required (project " + FIREBASE_PROJECT_ID + ")" : "NOT enforced (REQUIRE_AUTH=false)"}`);
   console.log(`   Endpoints:`);
   console.log(`     GET  /health`);
   console.log(`     POST /api/chat             (widget, help)`);
